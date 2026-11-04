@@ -1,0 +1,33 @@
+{
+  "name": "proto-hosting-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PROTO HOSTING BOT — premium Discord bot hosting platform for Proto Panel + Petro Panel (Pterodactyl-compatible). Register once with !register, deploy node.js / python servers with !HYdeploy, verified invites, full in-Discord server management.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node test/run-tests.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^17.2.3",
+    "express": "^4.22.2",
+    "socket.io-client": "2.4.0"
+  },
+  "keywords": [
+    "discord-bot",
+    "hosting",
+    "pterodactyl",
+    "petro-panel",
+    "proto-panel",
+    "nodejs",
+    "python"
+  ],
+  "author": "Proto Panel",
+  "license": "ISC"
+}
