@@ -1,0 +1,411 @@
+import express from "express";
+import path from "path";
+import { importWorld, getWorldInfo, analyzeWorld } from "../controllers/world.js";
+import { requireAuth } from "../middleware/auth.js";
+import { getServers, createServer, checkPort, getServer, deleteServer, startServer, stopServer, restartServer, killServer, changeServerVersion, updateRuntime, migrateServerRuntime, getFiles, uploadFile, uploadChunk, completeUpload, deleteFile, renameFile, saveFileContent, sendCommand, getServerStats, updateOwner, updateIpAlias, getBackups, createBackup, downloadBackup, deleteBackup, restoreBackup, unzipFile, zipFiles, installPlugin, installMod, getInstalledPlugins, deleteInstalledPlugin, getInstalledMods, deleteInstalledMod, getModrinthProjectVersions, updateResources, updateSuspend , createFile, createDirectory, downloadFile} from "../controllers/servers.js";
+import multer from "multer";
+
+const router = express.Router();
+// BUGFIX (DoS): uploads had no size limit at all. 2 GB still comfortably
+// covers the largest modpack jars/world zips.
+const upload = multer({
+  dest: path.join(process.cwd(), ".data/temp/"),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024, files: 1 }
+});
+
+router.use(requireAuth);
+
+router.get("/", getServers);
+router.get("/check-port", checkPort);
+router.post("/", createServer);
+router.get("/:id", getServer);
+router.get("/:id/stats", getServerStats);
+router.delete("/:id", deleteServer);
+router.put("/:id/owner", updateOwner);
+router.put("/:id/ipalias", updateIpAlias);
+
+router.put("/:id/version", changeServerVersion);
+router.put("/:id/runtime", updateRuntime);
+router.put("/:id/migrate-runtime", migrateServerRuntime);
+router.put("/:id/resources", updateResources);
+router.put("/:id/suspend", updateSuspend);
+
+
+router.post("/:id/start", startServer);
+router.post("/:id/stop", stopServer);
+router.post("/:id/restart", restartServer);
+router.post("/:id/kill", killServer);
+router.post("/:id/command", sendCommand);
+
+// Simple file endpoints
+router.get("/:id/files", getFiles);
+router.get("/:id/files/download", downloadFile);
+router.post("/:id/files/upload", upload.single("file"), uploadFile);
+router.post("/:id/files/upload-chunk", upload.single("chunk"), uploadChunk);
+router.post("/:id/files/upload-complete", completeUpload);
+router.post("/:id/files/rename", renameFile);
+router.post("/:id/files/save", saveFileContent);
+router.post("/:id/files/create", createFile);
+router.post("/:id/files/mkdir", createDirectory);
+router.post("/:id/files/unzip", unzipFile);
+router.post("/:id/world/analyze", analyzeWorld);
+router.post("/:id/world/import", importWorld);
+router.get("/:id/world/info", getWorldInfo);
+router.post("/:id/files/zip", zipFiles);
+router.delete("/:id/files", deleteFile);
+
+// Backup endpoints
+router.get("/:id/backups", getBackups);
+router.post("/:id/backups", createBackup);
+router.get("/:id/backups/:filename", downloadBackup);
+router.delete("/:id/backups/:filename", deleteBackup);
+router.post("/:id/backups/:filename/restore", restoreBackup);
+
+import { getContainerLogs } from "../services/docker.js";
+import { getLocalServerLogs } from "../services/local.js";
+
+router.get("/:id/logs", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const serversJSON = await (await import("fs/promises")).readFile(path.join(process.cwd(), ".data", "servers.json"), "utf8");
+    const servers = JSON.parse(serversJSON);
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+
+    // SECURITY FIX: logs used to be readable by ANY authenticated user.
+    const isPrivileged = reqUser && (reqUser.role === "admin" || reqUser.role === "owner");
+    const isOwner = reqUser && server.owner === reqUser.id;
+    const isSubUser = reqUser && Array.isArray(server.subUsers) && server.subUsers.some((x: any) => x.userId === reqUser.id);
+    if (!isPrivileged && !isOwner && !isSubUser) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    let logs = "";
+    const localLogs = await getLocalServerLogs(id);
+    if (localLogs) {
+      logs += localLogs.trim() + "\n";
+    }
+
+    if (server.containerId && !String(server.containerId).startsWith("local-")) {
+      // BUGFIX: pass server.nodeId so remote-node servers fetch logs from
+      // the right Docker daemon instead of silently returning nothing.
+      const dockerLogs = await getContainerLogs(server.containerId, server.nodeId);
+      if (dockerLogs) {
+        logs += dockerLogs.trim() + "\n";
+      }
+    }
+    res.json({ logs });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/:id/playit", async (req, res) => {
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") return res.status(403).json({ error: "Forbidden" });
+
+  const { id } = req.params;
+  const serversJSON = await (await import("fs/promises")).readFile(path.join(process.cwd(), ".data", "servers.json"), "utf8");
+  const servers = JSON.parse(serversJSON);
+  const server = servers.find((s: any) => s.id === id);
+  // SECURITY FIX: when the server id was unknown, the RAW unsanitized URL
+  // param flowed into shell commands (pm2 delete ...) — command injection.
+  if (!server) return res.status(404).json({ error: "Server not found" });
+  // Defense in depth: server ids are UUIDs
+  if (!/^[a-zA-Z0-9_-]+$/.test(String(id))) return res.status(400).json({ error: "Invalid server id" });
+
+  const serverName = server.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const pm2Name = `playit_${serverName}`;
+  
+  const { exec } = await import("child_process");
+  
+  exec("npx pm2 jlist", (err, stdout) => {
+    let status = "stopped";
+    try {
+      const jsonStart = stdout.indexOf('[');
+      const jsonEnd = stdout.lastIndexOf(']');
+      const jsonStr = jsonStart !== -1 && jsonEnd !== -1 ? stdout.substring(jsonStart, jsonEnd + 1) : stdout;
+      const pm2List = JSON.parse(jsonStr);
+      const playitProcess = pm2List.find((p: any) => p.name === pm2Name);
+      if (playitProcess && playitProcess.pm2_env && playitProcess.pm2_env.status === "online") {
+        status = "running";
+      }
+    } catch (e) {}
+
+    if (status === "running") {
+      exec(`npx pm2 logs ${pm2Name} --nostream --lines 100`, (err, logStdout, logStderr) => {
+        const logs = (logStdout || "").replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b./g, "");
+        const claimLinkMatches = logs.match(/https:\/\/playit\.gg\/claim\/[a-zA-Z0-9]+/g);
+        res.json({
+          status,
+          claimLink: claimLinkMatches ? claimLinkMatches[claimLinkMatches.length - 1] : null,
+          logs: logs.split('\n').slice(-50).join('\n')
+        });
+      });
+    } else {
+      res.json({ status: "stopped", claimLink: null, logs: "" });
+    }
+  });
+});
+
+router.post("/:id/playit/start", async (req, res) => { 
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") return res.status(403).json({ error: "Forbidden" });
+
+  const { id } = req.params;
+  const serversJSON = await (await import("fs/promises")).readFile(path.join(process.cwd(), ".data", "servers.json"), "utf8");
+  const servers = JSON.parse(serversJSON);
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) return res.status(404).json({ error: "Server not found" });
+  if (!/^[a-zA-Z0-9_-]+$/.test(String(id))) return res.status(400).json({ error: "Invalid server id" });
+
+  const serverName = server.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const pm2Name = `playit_${serverName}`;
+  
+  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+  const playitBin = path.join(serverDir, `playit_${serverName}`);
+  const secretPath = path.join(serverDir, "playit.toml");
+  
+  const { exec } = await import("child_process");
+  
+  const setupCmd = `mkdir -p "${serverDir}"; if [ ! -f "${playitBin}" ]; then wget -qO "${playitBin}" "https://github.com/playit-cloud/playit-agent/releases/download/v0.15.26/playit-linux-amd64" && chmod +x "${playitBin}"; fi`;
+  
+  exec(`npx pm2 delete ${pm2Name} || true; npx pm2 flush ${pm2Name} || true; ${setupCmd} && npx pm2 start "${playitBin}" --name ${pm2Name} -- -s --secret_path "${secretPath}" && npx pm2 save`, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({ error: "Failed to start Playit Tunnel", details: stderr });
+    }
+    res.json({ success: true });
+  });
+});
+
+router.post("/:id/playit/stop", async (req, res) => {
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") return res.status(403).json({ error: "Forbidden" });
+
+  const { id } = req.params;
+  const serversJSON = await (await import("fs/promises")).readFile(path.join(process.cwd(), ".data", "servers.json"), "utf8");
+  const servers = JSON.parse(serversJSON);
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) return res.status(404).json({ error: "Server not found" });
+
+  const serverName = server.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const pm2Name = `playit_${serverName}`;
+  
+  const { exec } = await import("child_process");
+  
+  exec(`npx pm2 delete ${pm2Name} && npx pm2 save`, (err, stdout, stderr) => {
+    res.json({ success: true });
+  });
+});
+
+router.post("/:id/playit/reset", async (req, res) => {
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") return res.status(403).json({ error: "Forbidden" });
+
+  const { id } = req.params;
+  const serversJSON = await (await import("fs/promises")).readFile(path.join(process.cwd(), ".data", "servers.json"), "utf8");
+  const servers = JSON.parse(serversJSON);
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) return res.status(404).json({ error: "Server not found" });
+
+  const serverName = server.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const pm2Name = `playit_${serverName}`;
+  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+  const secretPath = path.join(serverDir, "playit.toml");
+
+  const { exec } = await import("child_process");
+
+  exec(`npx pm2 delete ${pm2Name} || true; npx pm2 flush ${pm2Name} || true; rm -f "${secretPath}" && npx pm2 save`, (err, stdout, stderr) => {
+    res.json({ success: true });
+  });
+});
+
+// Sub-users endpoints
+router.get("/:id/subusers", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && server.owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const users = await readJSON("users.json") || [];
+    res.json({
+      subUsers: server.subUsers || [],
+      availableUsers: users.map((u: any) => ({ id: u.id, username: u.username }))
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/:id/subusers", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { userId, permissions } = req.body;
+    const { readJSON, writeJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const serverIndex = servers.findIndex((s: any) => s.id === id);
+    if (serverIndex === -1) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && servers[serverIndex].owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    if (!servers[serverIndex].subUsers) servers[serverIndex].subUsers = [];
+    const subUserIndex = servers[serverIndex].subUsers.findIndex((su: any) => su.userId === userId);
+    
+    if (subUserIndex !== -1) {
+      servers[serverIndex].subUsers[subUserIndex].permissions = permissions;
+    } else {
+      servers[serverIndex].subUsers.push({ userId, permissions });
+    }
+
+    await writeJSON("servers.json", servers);
+    res.json({ success: true, subUsers: servers[serverIndex].subUsers });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/:id/subusers/:userId", async (req, res) => {
+  try {
+    const { id, userId } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON, writeJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const serverIndex = servers.findIndex((s: any) => s.id === id);
+    if (serverIndex === -1) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && servers[serverIndex].owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    if (!servers[serverIndex].subUsers) servers[serverIndex].subUsers = [];
+    servers[serverIndex].subUsers = servers[serverIndex].subUsers.filter((su: any) => su.userId !== userId);
+
+    await writeJSON("servers.json", servers);
+    res.json({ success: true, subUsers: servers[serverIndex].subUsers });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+import { createSftpUser, resetSftpPassword, getSftpUser, deleteSftpUser } from "../services/sftp.js";
+
+// SFTP endpoints
+// BUGFIX: the API hardcoded port 6868, but the SFTP server actually listens
+// on 6869 when NODE_ENV !== "production" — dev users connected to a dead port.
+const sftpPort = () => (process.env.NODE_ENV === "production" ? 6868 : 6869);
+
+router.get("/:id/sftp", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && server.owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const user = await getSftpUser(id);
+    if (!user) return res.status(404).json({ error: "SFTP user not found" });
+    
+    // We don't send the password hash, but we might want to generate a new temporary 
+    // or just say it's hidden. But the UI expects the password to be returned upon creation/reset.
+    // So for GET, we don't have the plaintext password. We'll return a placeholder.
+    res.json({
+      host: req.headers.host?.split(":")[0] || "127.0.0.1",
+      port: sftpPort(),
+      username: user.username,
+      password: "(Hidden - Reset to reveal)"
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/:id/sftp/create", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && server.owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const creds = await createSftpUser(id);
+    res.json({
+      host: req.headers.host?.split(":")[0] || "127.0.0.1",
+      port: sftpPort(),
+      username: creds.username,
+      password: creds.password
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/:id/sftp/reset-password", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && server.owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const creds = await resetSftpPassword(id);
+    res.json({
+      host: req.headers.host?.split(":")[0] || "127.0.0.1",
+      port: sftpPort(),
+      username: creds.username,
+      password: creds.password
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/:id/sftp", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reqUser = (req as any).user;
+    const { readJSON } = await import("../services/db.js");
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if (reqUser.role !== "admin" && reqUser.role !== "owner" && server.owner !== reqUser.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    await deleteSftpUser(id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/:id/plugins/install", installPlugin);
+router.get("/:id/plugins/installed", getInstalledPlugins);
+router.delete("/:id/plugins/:filename", deleteInstalledPlugin);
+
+router.post("/:id/mods/install", installMod);
+router.get("/:id/mods/installed", getInstalledMods);
+router.delete("/:id/mods/:filename", deleteInstalledMod);
+
+router.get("/:id/modrinth/versions/:projectId", getModrinthProjectVersions);
+
+export default router;

